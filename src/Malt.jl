@@ -5,7 +5,7 @@ these functions are not stable.
 """
 module Malt
 
-# using Logging: Logging, @debug
+using Logging: Logging, @debug
 using Serialization: serialize, deserialize
 using Sockets: Sockets
 
@@ -43,7 +43,11 @@ end
 
 function unwrap_worker_result(worker::AbstractWorker, result::WorkerResult)
     if result.msg_type == MsgType.special_serialization_failure
-        throw(ErrorException("Error deserializing data from $(summary(worker)):\n\n$(sprint(Base.showerror, result.value))"))
+        throw(
+            ErrorException(
+                "Error deserializing data from $(summary(worker)):\n\n$(sprint(Base.showerror, result.value))"
+            )
+        )
     elseif result.msg_type == MsgType.special_worker_terminated
         throw(TerminatedWorkerException())
     elseif result.msg_type == MsgType.from_worker_call_failure
@@ -72,13 +76,17 @@ mutable struct InProcessWorker <: AbstractWorker
     end
 end
 
-Base.summary(io::IO, w::InProcessWorker) = write(io, "Malt.InProcessWorker in module $(w.host_module)")
+Base.summary(io::IO, w::InProcessWorker) =
+    write(io, "Malt.InProcessWorker in module $(w.host_module)")
 
 const __iNtErNaL_running_procs = Set{Base.Process}()
 const procs_lock = ReentrantLock()
-__iNtErNaL_get_running_procs() = Base.@lock procs_lock filter!(Base.process_running, __iNtErNaL_running_procs)
+__iNtErNaL_get_running_procs() =
+    Base.@lock procs_lock filter!(Base.process_running, __iNtErNaL_running_procs)
 
 _default_connect_timeout() = parse(Float64, get(ENV, "JULIA_WORKER_TIMEOUT", "30.0"))
+
+include("lifecycle.jl")
 
 """
     Malt.Worker()
@@ -89,7 +97,7 @@ Create a new `Worker`. A `Worker` struct is a handle to a (separate) Julia proce
 
 ```julia-repl
 julia> w = Malt.Worker()
-Malt.Worker(0x0000, Process(`…`, ProcessRunning))
+Malt.Worker on port 9000 with PID 12345
 ```
 
 # Keyword arguments
@@ -98,250 +106,78 @@ Malt.Worker(0x0000, Process(`…`, ProcessRunning))
 - `exeflags::Vector{String}`: Additional command-line flags to pass to the Julia executable.
 - `monitor_stdout::Bool=true`: Whether to print the stdout of the worker process to the main process's stdout. When set to `false`, you can access the stdout `Pipe` via the `worker.stdout` field after creation.
 - `monitor_stderr::Bool=true`: Same for `stderr`.
-- `connect_timeout::Real`: How many seconds to wait for the worker process to start and report its port before killing it. Defaults to the `JULIA_WORKER_TIMEOUT` environment variable, which `Distributed` (and so `Malt.DistributedStdlibWorker`) also uses, or 30 seconds if it is not set. If the worker process exits before that, the constructor throws right away.
+- `connect_timeout::Real`: One monotonic budget in seconds for startup, port announcement, TCP connection and an exact protocol readiness round trip before publishing the handle. Defaults to the `JULIA_WORKER_TIMEOUT` environment variable, which `Distributed` (and so `Malt.DistributedStdlibWorker`) also uses, or 30 seconds if it is not set. A failed or expired startup kills the child and performs tracked rollback with its own bounded cleanup allowance; `WorkerStartupException.report` exposes any incomplete cleanup.
 """
 mutable struct Worker <: AbstractWorker
-    port::UInt16
-    proc::Base.Process
-    proc_pid::Int32
+    state::WorkerState
+    _reply_handles::Dict{MsgID,Channel{WorkerResult}}
 
-    current_socket::Sockets.TCPSocket
-    # socket_lock::ReentrantLock
-
-    current_message_id::MsgID
-    expected_replies::Dict{MsgID,Channel{WorkerResult}}
-
-    # Pipes used for collecting the stdout/stderr of the process
-    stdout::Pipe
-    stderr::Pipe
-    
-    function Worker(
-        ;
-        env=String[],
-        exename=Base.julia_cmd()[1],
-        exeflags=[],
-        monitor_stdout::Bool=true,
-        monitor_stderr::Bool=true,
-        connect_timeout::Real=_default_connect_timeout(),
-        )
-        # Spawn process
-        cmd = _get_worker_cmd(exename; env, exeflags)
-        _stdout = Pipe()
-        _stderr = Pipe()
-        proc = run(
-            pipeline(Cmd(
-                    cmd;
-                    detach=true,
-                    windows_hide=true,
-                ), stdout=_stdout, stderr=_stderr),
-            wait=false,
-        )
-
-        # Keep internal list
-        __iNtErNaL_get_running_procs()
-        Base.@lock procs_lock push!(__iNtErNaL_running_procs, proc)
-
-        yield() # https://github.com/fonsp/Pluto.jl/issues/3423
-
-        port_task = @async begin
-            port_str = readline(_stdout)
-            parse(UInt16, port_str)
-        end
-
-        poll_result = timedwait(() -> istaskdone(port_task), connect_timeout; pollint=0.02)
-        port = try
-            if poll_result == :timed_out
-                error("Timeout")
+    function Worker(; env=String[], exename=Base.julia_cmd()[1], exeflags=[],
+        monitor_stdout::Bool=true, monitor_stderr::Bool=true,
+        connect_timeout::Real=_default_connect_timeout())
+        state, started, budget =
+            _construct_worker_state(; env, exename, exeflags, monitor_stdout,
+                monitor_stderr, connect_timeout)
+        worker = new(state, Dict{MsgID,Channel{WorkerResult}}())
+        state.handle = WeakRef(worker)
+        GC.@preserve worker begin
+            ready_task = try
+                _start_worker_loops!(state)
+                _start_startup_ready!(state, started, budget)
+            catch error
+                throw(_rollback_startup!(state, error))
             end
-            fetch(port_task)
-        catch
-            stderr_tobekilled = _readavailable_nonblocking(_stderr)
-            process_running(proc) && kill(proc, Base.SIGKILL)
-            error("Worker process exited before we could connect. Stderr:\n$(stderr_tobekilled)")
-        end
-
-
-        # Connect
-        socket = Sockets.connect(port)
-        _buffer_writes(socket)
-
-
-        # There's no reason to keep the worker process alive after the manager loses its handle.
-        w = finalizer(w -> @async(stop(w)),
-            new(
-                port,
-                proc,
-                getpid(proc),
-                socket,
-                MsgID(0),
-                Dict{MsgID,Channel{WorkerResult}}(),
-                _stdout,
-                _stderr
-            )
-        )
-        atexit(() -> stop(w))
-        _stdio_loop(w; monitor_stdout, monitor_stderr)
-        _exit_loop(w)
-        _receive_loop(w)
-
-        return w
-    end
-end
-
-# Workaround for https://github.com/JuliaLang/julia/issues/57994
-function _readavailable_nonblocking(pipe::Pipe; timeout_s::Real=3.0)
-    (isopen(pipe) && isreadable(pipe)) || return nothing
-    
-    result = Ref{Union{Nothing,String}}(nothing)
-    t = @async result[] = String(readavailable(pipe))
-    timer_result = timedwait(() -> istaskdone(t), timeout_s)
-    if timer_result === :timed_out && !istaskdone(t)
-        try
-            Base.schedule(t, InterruptException(); error=true)
-        catch
-        end
-    end
-    result[]
-end
-
-Base.summary(io::IO, w::Worker) = write(io, "Malt.Worker on port $(w.port) with PID $(w.proc_pid)")
-
-function _stdio_loop(worker::Worker; monitor_stdout::Bool, monitor_stderr::Bool)
-    monitor_stdout && @async while isopen(worker.stdout) && isrunning(worker)
-        try
-            bytes = readline(worker.stdout)
-            c = get(stdout, :color, false) === true
-            prefix = c ? "\e[34m[Worker $(worker.proc_pid)]:\e[39m " : "[Worker $(worker.proc_pid)]: "
-            write(stdout, prefix, bytes, '\n')
-            flush(stdout)
-        catch
-            break
-        end
-    end
-    monitor_stderr && @async while isopen(worker.stderr) && isrunning(worker)
-        try
-            bytes = readline(worker.stderr)
-            c = get(stderr, :color, false) === true
-            prefix = c ? "\e[33m[Worker $(worker.proc_pid)]:\e[39m " : "[Worker $(worker.proc_pid)]: "
-            write(stderr, prefix, bytes, '\n')
-            flush(stderr)
-        catch
-            break
+            _complete_worker_startup!(worker, ready_task, started, budget)
         end
     end
 end
 
-function _exit_loop(worker::Worker)
-    @async for _i in Iterators.countfrom(1)
+function _complete_worker_startup!(worker::Worker, ready_task::Task,
+    started::UInt64, budget::UInt64)
+    GC.@preserve worker begin
         try
-            if !isrunning(worker)
-                # the worker got shut down, which means that we will never receive one of the expected_replies. So let's give all of them a special_worker_terminated reply.
-                for c in values(worker.expected_replies)
-                    isready(c) || put!(c, WorkerResult(MsgType.special_worker_terminated, nothing))
-                end
-                break
-            end
-        catch e
-            @error "Unexpected error encountered in the exit loop" worker exception = (e, catch_backtrace())
-        end
-        try
-            sleep(1)
-        catch e
-            e isa EOFError || rethrow(e)
+            _wait_bounded(() -> istaskdone(ready_task), started, budget) ||
+                error("Worker readiness timed out")
+            fetch(ready_task)
+            _ensure_startup_budget!(started, budget)
+            finalizer(_finalize_worker, worker)
+            _ensure_startup_budget!(started, budget)
+            worker
+        catch error
+            throw(_rollback_startup!(worker.state, error))
         end
     end
 end
 
-function _receive_loop(worker::Worker)
-    io = worker.current_socket
-
-
-    # Here we use:
-    # `for _i in Iterators.countfrom(1)`
-    # instead of
-    # `while true`
-    # as a workaround for https://github.com/JuliaLang/julia/issues/37154
-    @async for _i in Iterators.countfrom(1)
-        try
-            if !isopen(io)
-                @debug("HOST: io closed.")
-                break
-            end
-
-            @debug "HOST: Waiting for message"
-            msg_type = try
-                if eof(io)
-                    @debug("HOST: io closed.")
-                    break
-                end
-                read(io, UInt8)
-            catch e
-                if e isa InterruptException
-                    @debug("HOST: Caught interrupt while waiting for incoming data, rethrowing to REPL...")
-                    _rethrow_to_repl(e; rethrow_regular=false)
-                    continue # and go back to waiting for incoming data
-                else
-                    @debug("HOST: Caught exception while waiting for incoming data, breaking", exception = (e, backtrace()))
-                    break
-                end
-            end
-            # this next line can't fail
-            msg_id = read(io, MsgID)
-
-            msg_data, success = try
-                deserialize(io), true
-            catch err
-                err, false
-            finally
-                _discard_until_boundary(io)
-            end
-
-            if !success
-                msg_type = MsgType.special_serialization_failure
-            end
-
-            # msg_type will be one of:
-            #  MsgType.from_worker_call_result
-            #  MsgType.from_worker_call_failure
-            #  MsgType.special_serialization_failure
-
-            c = get(worker.expected_replies, msg_id, nothing)
-            if c isa Channel{WorkerResult}
-                put!(c, WorkerResult(msg_type, msg_data))
-            else
-                @error "HOST: Received a response, but I didn't ask for anything" msg_type msg_id msg_data
-            end
-
-            @debug("HOST: Received message", msg_data)
-        catch e
-            if e isa InterruptException
-                @debug "HOST: Interrupted during receive loop."
-                _rethrow_to_repl(e)
-            elseif e isa Base.IOError && !isopen(io)
-                sleep(3)
-                if isrunning(worker)
-                    @error "HOST: Connection lost with worker, but the process is still running. Killing process..." exception = (e, catch_backtrace())
-                    kill(worker, Base.SIGKILL)
-                else
-                    # This is a clean exit
-                end
-                break
-            else
-                @error "HOST: Unknown error" exception = (e, catch_backtrace()) isopen(io)
-
-                break
-            end
-        end
-    end
+# Preserve documented field access (notably the two caller-readable Pipes)
+# while listeners retain only the internal state rather than the public handle.
+function Base.getproperty(worker::Worker, name::Symbol)
+    (name === :state || name === :_reply_handles) && return getfield(worker, name)
+    getproperty(getfield(worker, :state), name)
+end
+function Base.setproperty!(worker::Worker, name::Symbol, value)
+    (name === :state || name === :_reply_handles) && return setfield!(worker, name, value)
+    setproperty!(getfield(worker, :state), name, value)
+end
+function Base.propertynames(::Worker, private::Bool=false)
+    visible = (:state, :port, :proc, :proc_pid, :current_socket, :current_message_id,
+        :expected_replies, :stdout, :stderr)
+    private ? (visible..., :_reply_handles) : visible
 end
 
-
+Base.summary(io::IO, worker::Worker) =
+    print(io, "Malt.Worker on port ", worker.port, " with PID ", worker.proc_pid)
+Base.show(io::IO, worker::Worker) = summary(io, worker)
+Base.show(io::IO, ::MIME"text/plain", worker::Worker) = summary(io, worker)
 
 # The entire `src` dir should be relocatable, so that worker.jl can include("MsgType.jl").
 const src_path = RelocatableFolders.@path @__DIR__
 
 function _get_worker_cmd(exename=Base.julia_cmd()[1]; env, exeflags)
-    return addenv(`$exename --startup-file=no $exeflags $(joinpath(src_path, "worker.jl"))`, String["OPENBLAS_NUM_THREADS=1", Base.byteenv(env)...])
+    return addenv(
+        `$exename --startup-file=no $exeflags $(joinpath(src_path, "worker.jl"))`,
+        String["OPENBLAS_NUM_THREADS=1", Base.byteenv(env)...]
+    )
 end
 
 
@@ -384,36 +220,49 @@ _new_do_msg(f::Function, args, kwargs) = (
 # GENERIC COMMUNICATION PROTOCOL
 
 """
-Low-level: send a message to a worker. Returns a `msg_id::UInt16`, which can be used to wait for a response with `_wait_for_response`.
+Low-level: send a message to a worker. Returns a `msg_id::MsgID` (`UInt64`), which can be used to wait for a response with `_wait_for_response`.
 """
-function _send_msg(worker::Worker, msg_type::UInt8, msg_data, expect_reply::Bool=true)::MsgID
-    _assert_is_running(worker)
-    # _ensure_connected(worker)
-
-    msg_id = (worker.current_message_id += MsgID(1))::MsgID
-    if expect_reply
-        worker.expected_replies[msg_id] = Channel{WorkerResult}(1)
+function _send_msg(
+    worker::Worker,
+    msg_type::UInt8,
+    msg_data,
+    expect_reply::Bool=true
+)::MsgID
+    GC.@preserve worker begin
+        id, cell = _send_message!(worker.state, msg_type, msg_data, expect_reply)
+        if cell !== nothing
+            lock(worker.state.lock) do
+                worker._reply_handles[id] = cell
+            end
+        end
+        id
     end
-
-    @debug("HOST: sending message", msg_data)
-
-    _serialize_msg(worker.current_socket, msg_type, msg_id, msg_data)
-
-    return msg_id
 end
 
 """
 Low-level: wait for a response to a previously sent message. Returns the response. Blocking call.
 """
 function _wait_for_response(worker::Worker, msg_id::MsgID)
-    if haskey(worker.expected_replies, msg_id)
-        c = worker.expected_replies[msg_id]
-        @debug("HOST: waiting for response of", msg_id)
-        response = take!(c)
-        delete!(worker.expected_replies, msg_id)
-        return unwrap_worker_result(worker, response)
-    else
-        error("HOST: No response expected for message id $msg_id")
+    cell = lock(worker.state.lock) do
+        get(worker._reply_handles, msg_id) do
+            get(worker.expected_replies, msg_id, nothing)
+        end
+    end
+    cell === nothing && throw(TerminatedWorkerException())
+    try
+        _wait_for_response(worker, msg_id, cell)
+    finally
+        lock(worker.state.lock) do
+            if get(worker._reply_handles, msg_id, nothing) === cell
+                delete!(worker._reply_handles, msg_id)
+            end
+        end
+    end
+end
+
+function _wait_for_response(worker::Worker, id::MsgID, cell::Channel{WorkerResult})
+    GC.@preserve worker begin
+        _wait_for_response(worker.state, id, cell)
     end
 end
 
@@ -421,17 +270,24 @@ end
 `_wait_for_response ∘ _send_msg`
 """
 function _send_receive(w::Worker, msg_type::UInt8, msg_data)
-    msg_id = _send_msg(w, msg_type, msg_data, true)
-    return _wait_for_response(w, msg_id)
+    GC.@preserve w begin
+        id, cell = _send_message!(w.state, msg_type, msg_data, true)
+        _wait_for_response(w, id, cell::Channel{WorkerResult})
+    end
 end
 
 """
 `@async(_wait_for_response) ∘ _send_msg`
 """
-function _send_receive_async(w::Worker, msg_type::UInt8, msg_data, output_transformation=identity)::Task
-    # TODO: Unwrap TaskFailedExceptions
-    msg_id = _send_msg(w, msg_type, msg_data, true)
-    return @async output_transformation(_wait_for_response(w, msg_id))
+function _send_receive_async(
+    w::Worker,
+    msg_type::UInt8,
+    msg_data,
+    output_transformation=identity
+)::Task
+    state = w.state
+    id, cell = _send_message!(state, msg_type, msg_data, true)
+    _reply_task!(state, w, id, cell::Channel{WorkerResult}, output_transformation)
 end
 
 
@@ -470,12 +326,14 @@ function remote_call_fetch(f, w::InProcessWorker, args...; kwargs...)
     try
         f(args...; kwargs...)
     catch ex
-        throw(RemoteException(
-            w,
-            sprint() do io
-                Base.invokelatest(showerror, io, ex, catch_backtrace())
-            end
-        ))
+        throw(
+            RemoteException(
+                w,
+                sprint() do io
+                    Base.invokelatest(showerror, io, ex, catch_backtrace())
+                end
+            )
+        )
     end
 end
 function remote_call_wait(f, w::InProcessWorker, args...; kwargs...)
@@ -570,14 +428,16 @@ remote_eval(w::AbstractWorker, expr) = remote_eval(Main, w, expr)
 """
 Shorthand for `fetch(Malt.remote_eval(…))`. Blocks and returns the resulting value.
 """
-remote_eval_fetch(mod::Module, w::AbstractWorker, expr) = remote_call_fetch(Core.eval, w, mod, expr)
+remote_eval_fetch(mod::Module, w::AbstractWorker, expr) =
+    remote_call_fetch(Core.eval, w, mod, expr)
 remote_eval_fetch(w::AbstractWorker, expr) = remote_eval_fetch(Main, w, expr)
 
 
 """
 Shorthand for `wait(Malt.remote_eval(…))`. Blocks and discards the resulting value.
 """
-remote_eval_wait(mod::Module, w::AbstractWorker, expr) = remote_call_wait(Core.eval, w, mod, expr)
+remote_eval_wait(mod::Module, w::AbstractWorker, expr) =
+    remote_call_wait(Core.eval, w, mod, expr)
 remote_eval_wait(w::AbstractWorker, expr) = remote_eval_wait(Main, w, expr)
 
 
@@ -606,7 +466,7 @@ struct RemoteChannel{T} <: AbstractChannel{T}
 
     function RemoteChannel{T}(worker::Worker, expr) where {T}
 
-        id = (worker.current_message_id += MsgID(1))::MsgID
+        id = _next_message_id!(worker.state)
         remote_eval_wait(Main, worker, quote
             Main._channel_cache[$id] = $expr
         end)
@@ -616,13 +476,17 @@ struct RemoteChannel{T} <: AbstractChannel{T}
     RemoteChannel(w::Worker, expr) = RemoteChannel{Any}(w, expr)
 end
 
-Base.take!(rc::RemoteChannel) = remote_eval_fetch(Main, rc.worker, :(take!(Main._channel_cache[$(rc.id)])))::eltype(rc)
+Base.take!(rc::RemoteChannel) =
+    remote_eval_fetch(Main, rc.worker, :(take!(Main._channel_cache[$(rc.id)])))::eltype(rc)
 
-Base.put!(rc::RemoteChannel, v) = remote_eval_wait(Main, rc.worker, :(put!(Main._channel_cache[$(rc.id)], $v)))
+Base.put!(rc::RemoteChannel, v) =
+    remote_eval_wait(Main, rc.worker, :(put!(Main._channel_cache[$(rc.id)], $v)))
 
-Base.isready(rc::RemoteChannel) = remote_eval_fetch(Main, rc.worker, :(isready(Main._channel_cache[$(rc.id)])))::Bool
+Base.isready(rc::RemoteChannel) =
+    remote_eval_fetch(Main, rc.worker, :(isready(Main._channel_cache[$(rc.id)])))::Bool
 
-Base.wait(rc::RemoteChannel) = remote_eval_wait(Main, rc.worker, :(wait(Main._channel_cache[$(rc.id)])))::Bool
+Base.wait(rc::RemoteChannel) =
+    remote_eval_wait(Main, rc.worker, :(wait(Main._channel_cache[$(rc.id)])))::Bool
 
 
 ## Signals & Termination
@@ -647,20 +511,44 @@ If `w` is still alive, and now terminated, `stop` returns true.
 If `w` is already dead, `stop` returns `false`.
 If `w` failed to terminate, throw an exception.
 """
-function stop(w::Worker; exit_timeout::Real=15.0, term_timeout::Real=15.0)
-    ir = () -> !isrunning(w)
-    if isrunning(w)
-        remote_do(Base.exit, w)
-        if !_poll(ir; timeout_s=exit_timeout)
-            kill(w, Base.SIGTERM)
-            if !_poll(ir; timeout_s=term_timeout)
-                kill(w, Base.SIGKILL)
-                _wait_for_exit(w)
-            end
-        end
-        true
-    else
-        false
+function stop(w::Worker; exit_timeout::Real=15.0, term_timeout::Real=15.0,
+    timeout::Real=exit_timeout + term_timeout + 20.0)
+    GC.@preserve w begin
+        _, was_running = _shutdown_state!(w.state; exit_timeout, term_timeout, timeout,
+            close_unmonitored=false)
+        was_running
+    end
+end
+
+"""
+    Malt.shutdown(w::Worker; exit_timeout=15.0, term_timeout=15.0,
+                  timeout=exit_timeout + term_timeout + 20.0,
+                  close_unmonitored=true)::WorkerShutdownReport
+
+Stop admission, settle outstanding RPCs, request `Base.exit`, then escalate to
+TERM and KILL if necessary. One monotonic `timeout` (seconds) includes waiting
+for another shutdown, sending the exit request, closing connections and joining
+all retained tasks. The two phase timeouts are caps within that total budget.
+
+The immutable report includes the actual exit code and signal. A resource-complete
+shutdown does not imply a successful computation. Incomplete cleanup throws
+`ShutdownIncompleteException` carrying `.report`; a later call can retry it.
+With `timeout=0`, only an already complete observation is returned, without
+starting work. Arbitrary noncooperative serializer or output-sink code cannot
+be forcibly preempted and prevents a complete report while it is still active.
+
+Unmonitored Pipes are closed and their unread contents discarded by default.
+With `close_unmonitored=false`, caller-owned Pipes remain readable: an otherwise
+finished shutdown returns a report with `complete=false` until they are closed.
+Legacy `stop` preserves those Pipes and returns its historical entry-state Bool.
+"""
+function shutdown(w::Worker; exit_timeout::Real=15.0, term_timeout::Real=15.0,
+    timeout::Real=exit_timeout + term_timeout + 20.0, close_unmonitored::Bool=true)
+    GC.@preserve w begin
+        first(
+            _shutdown_state!(w.state; exit_timeout, term_timeout, timeout,
+                close_unmonitored)
+        )
     end
 end
 function stop(w::InProcessWorker)
@@ -674,7 +562,7 @@ end
 Terminate the worker process `w` forcefully by sending a `SIGTERM` signal (unless otherwise specified).
 
 This is not the recommended way to terminate the process. See `Malt.stop`.
-""" # https://youtu.be/dyIilW_eBjc
+"""
 Base.kill(w::Worker, signum=Base.SIGTERM) = Base.kill(w.proc, signum)
 Base.kill(::InProcessWorker, signum=Base.SIGTERM) = nothing
 
@@ -701,23 +589,41 @@ end
 """
     Malt.interrupt(w::Worker)
 
-Send an interrupt signal to the worker process. This will interrupt the
-latest request (`remote_call*` or `remote_eval*`) that was sent to the worker.
+Request an interrupt while an application call may still be executing remotely.
+With no known remote application work, this is a no-op. Local abandonment of a
+waiter does not make its remote call idle; `remote_do` remains active until its
+internal completion acknowledgement arrives. Startup readiness is not application
+work. Native SIGINT is asynchronous and does not target a particular message ID:
+the last result may still be in transit, so this is not a general proof that a
+signal cannot arrive after the remote computation finished.
 """
 function interrupt(w::Worker)
-    if !isrunning(w)
-        @warn "Tried to interrupt a worker that has already shut down." summary(w)
-    else
-        if Sys.iswindows()
-            ccall((:GenerateConsoleCtrlEvent, "Kernel32"), Bool, (UInt32, UInt32), UInt32(1), UInt32(getpid(w.proc)))
-        else
-            Base.kill(w.proc, Base.SIGINT)
+    GC.@preserve w begin
+        state = w.state
+        outcome = lock(state.lock) do
+            Base.process_running(state.proc) || return :dead
+            isempty(state.remote_calls) && return :idle
+            if Sys.iswindows()
+                ccall(
+                    (:GenerateConsoleCtrlEvent, "Kernel32"),
+                    Bool,
+                    (UInt32, UInt32),
+                    UInt32(1),
+                    UInt32(state.proc_pid)
+                )
+            else
+                Base.kill(state.proc, Base.SIGINT)
+            end
+            :sent
         end
+        outcome === :dead &&
+            @warn "Tried to interrupt a worker that has already shut down." summary(w)
     end
     nothing
 end
 function interrupt(w::InProcessWorker)
-    istaskdone(w.latest_request_task) || schedule(w.latest_request_task, InterruptException(); error=true)
+    istaskdone(w.latest_request_task) ||
+        schedule(w.latest_request_task, InterruptException(); error=true)
     nothing
 end
 
@@ -727,16 +633,17 @@ end
 # Based on `Base.task_done_hook`
 function _rethrow_to_repl(e::InterruptException; rethrow_regular::Bool=false)
     if isdefined(Base, :active_repl_backend) &&
-       isdefined(Base.active_repl_backend, :backend_task) &&
-       isdefined(Base.active_repl_backend, :in_eval) &&
-       Base.active_repl_backend.backend_task.state === :runnable &&
-       (isdefined(Base, :Workqueue) || isempty(Base.Workqueue)) &&
-       Base.active_repl_backend.in_eval
+        isdefined(Base.active_repl_backend, :backend_task) &&
+        isdefined(Base.active_repl_backend, :in_eval) &&
+        Base.active_repl_backend.backend_task.state === :runnable &&
+        (isdefined(Base, :Workqueue) || isempty(Base.Workqueue)) &&
+        Base.active_repl_backend.in_eval
 
         @debug "HOST: Rethrowing interrupt to REPL"
         @async Base.schedule(Base.active_repl_backend.backend_task, e; error=true)
     elseif rethrow_regular
-        @debug "HOST: Don't know what to do with this interrupt, rethrowing" exception = (e, catch_backtrace())
+        @debug "HOST: Don't know what to do with this interrupt, rethrowing" exception =
+            (e, catch_backtrace())
         rethrow(e)
     end
 end

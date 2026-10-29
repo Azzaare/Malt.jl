@@ -1,16 +1,19 @@
 
 
 @testset "Starting exceptions" begin
-    # Searching for strings requires Julia 1.8
-    needle = VERSION >= v"1.8.0" ? ["exited before we could connect", "threads"] : ErrorException
-
-    tstart = time()
-    @test_throws needle m.Worker(; exeflags = ["-t invalid"])
-    tend = time()
-
-    # When we create a worker we start a timedwait (currently of 30 seconds), trying to
-    # connect to it.  When the Julia process is launched with invalid arguments, the poll
-    # will time out because it'll fail to connect to it.  Here we check that the whole
-    # process took a reasonable time around 30 seconds.
-    @test 25.0 < tend - tstart < 40.0
+    # A child that exits before publishing a port must fail construction. There is
+    # no required thirty-second delay: connect_timeout is an explicit upper bound
+    # for the connection phase, and lifecycle_contracts.jl checks owned cleanup.
+    failure = try
+        m.Worker(; exeflags = ["-t invalid"], connect_timeout = 2.0)
+        nothing
+    catch error
+        error
+    end
+    @test failure isa m.WorkerStartupException
+    @test failure.cause isa Exception
+    @test occursin("exited before we could connect", sprint(showerror, failure))
+    @test occursin(r"threads?|-t"i, sprint(showerror, failure))
+    @test failure.report.complete
+    @test failure.report.process_exited && failure.report.tasks_done
 end

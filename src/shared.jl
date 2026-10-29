@@ -1,21 +1,23 @@
 
 const MsgType = (
-    from_host_call_with_response = UInt8(1),
-    from_host_call_without_response = UInt8(2),
-    from_host_fake_interrupt = UInt8(20),
+    from_host_call_with_response=UInt8(1),
+    from_host_call_without_response=UInt8(2),
+    from_host_fake_interrupt=UInt8(20),
     ####
-    from_worker_call_result = UInt8(80),
-    from_worker_call_failure = UInt8(81),
+    from_worker_call_result=UInt8(80),
+    from_worker_call_failure=UInt8(81),
+    from_worker_call_finished=UInt8(82),
     ###
-    special_serialization_failure = UInt8(100),
-    special_worker_terminated = UInt8(101),
+    special_serialization_failure=UInt8(100),
+    special_worker_terminated=UInt8(101),
 )
 
 const MsgID = UInt64
 
 const BUFFER_SIZE = 65536 # Base.SZ_UNBUFFERED_IO
 # Future-compat version of Base.buffer_writes
-_buffer_writes(io) = @static if isdefined(Base, :buffer_writes) && hasmethod(Base.buffer_writes, (Base.LibuvStream, Int))
+_buffer_writes(io) = @static if isdefined(Base, :buffer_writes) &&
+    hasmethod(Base.buffer_writes, (Base.LibuvStream, Int))
     Base.buffer_writes(io, BUFFER_SIZE)
 end
 

@@ -17,8 +17,11 @@ include("starting.jl")
 v()
 include("stdout.jl")
 v()
-include("benchmark.jl")
+include("lifecycle_contracts.jl")
 v()
-
-#TODO: 
-# test that worker.expected_replies is empty after a call
+if get(ENV, "MALT_RUN_BENCHMARKS", "false") == "true"
+    include("benchmark.jl")
+else
+    @info "Performance campaign excluded from functional tests; set MALT_RUN_BENCHMARKS=true to run test/benchmark.jl explicitly."
+end
+v()
