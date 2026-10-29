@@ -23,8 +23,8 @@ jobs:
             # Without setting this, a failing test cancels all others
             fail-fast: false
             matrix:
-                # We test quite a lot of versions because we do some OS and version specific things unfortunately
-                julia-version: ['1.6', '1.8', 'lts', '1', 'pre', 'nightly']
+                # The SDK targets Julia 1.13 on every qualified platform.
+                julia-version: ['1.13']
                 os: [ubuntu-latest, macOS-latest, windows-latest]
 
         steps:
@@ -35,7 +35,7 @@ jobs:
             - uses: julia-actions/setup-julia@v3
               with:
                   version: ${{ matrix.julia-version }}
-                  arch: ${{ (matrix.julia-version == '1.6' || matrix.julia-version == '1.7') && 'x64' || runner.arch }}
+                  arch: ${{ runner.arch }}
 
             - uses: julia-actions/cache@v3
 

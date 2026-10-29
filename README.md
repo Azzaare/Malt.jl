@@ -5,6 +5,9 @@ lifecycle API described below. Its changes are maintained in the
 [SDK repository](https://gitlab.naze.baffier.fr/etendu3d/Malt.jl); the original
 upstream project and history remain [JuliaPluto/Malt.jl](https://github.com/JuliaPluto/Malt.jl).
 
+The SDK requires Julia 1.13. The package version `Malt 1.6.0` identifies this
+library release; it does not declare support for the Julia 1.6 runtime.
+
 Malt is a multiprocessing package for Julia. It is used by [Pluto.jl](https://plutojl.org/) to manage the Julia process that notebook code is executed in, as a [replacement to Distributed](https://github.com/fonsp/Pluto.jl/pull/2240).
 
 The [upstream API manual](https://juliapluto.github.io/Malt.jl) describes the

@@ -2,6 +2,8 @@ using Documenter
 using Malt
 
 makedocs(
+    repo = Documenter.Remotes.GitLab("gitlab.naze.baffier.fr", "etendu3d", "Malt.jl"),
+    build = get(ENV, "MALT_DOCS_BUILD", "build"),
     sitename = "Malt",
     format = Documenter.HTML(repolink = "https://gitlab.naze.baffier.fr/etendu3d/Malt.jl"),
     modules = [Malt],

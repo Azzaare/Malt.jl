@@ -6,6 +6,17 @@ contract for `Malt.Worker`; the other worker adapters retain their own lifetime
 rules. The [lifecycle guide](lifecycle.md) describes the public contract and
 migration from `stop`.
 
+The SDK runtime requirement is **Julia 1.13**. Earlier exploratory runs on Julia
+1.6 and 1.12 are preserved below as historical evidence, not supported SDK
+targets. Subsequent validation uses Julia 1.13 only. The compatibility correction
+changes package metadata and CI, not the runtime code qualified here.
+The corrected root Project has SHA-256
+`e369b15a6105340a307425c464076176899ffaf2daea71bcb86a2868c26bb17b`.
+After resolution with all dependency versions and sources preserved, Aqua
+passes **11/11 checks** on Julia 1.13.1 at **23:36:38.420–23:36:46.322 UTC**
+on 29 October 2026. Standard-library compatibility entries use their package
+versions (`1`); these are independent of the Julia runtime floor (`1.13`).
+
 ## What the tests exercise
 
 The functional suite retains the upstream RPC, nesting, exceptions, output and
@@ -71,7 +82,7 @@ interruption as an application cancellation policy.
 
 ## Source and functional qualification
 
-Runtime and tests are committed as
+The runtime and test snapshot, before the Julia compatibility correction, is
 `e90cdf72ad021157ffdc4f4e28c09fd39a82d355`. The following SHA-256 values were
 checked before and after the functional runs:
 
@@ -90,11 +101,11 @@ one thread in each child; newer runtimes use one GC thread, while Julia 1.6
 uses its serial collector. Both performance opt-in and external tracing are
 disabled in these complete runs.
 
-| Julia | PASS / failed / errors / broken | UTC start–finish | UTC interval | Peak RSS |
+| Julia / purpose | PASS / failed / errors / broken | UTC start–finish | UTC interval | Peak RSS |
 |---|---|---|---|---|
-| 1.6.7 | 1151 / 0 / 0 / 1 | 22:21:51–22:24:11 | 139.93 s | 397264 KiB |
-| 1.12.7 | 1185 / 0 / 0 / 1 | 22:19:14–22:22:06 | 171.87 s | 564440 KiB |
-| 1.13.1 | 1308 / 0 / 0 / 1 | 22:28:29–22:31:08 | 158.90 s | 521548 KiB |
+| 1.13.1 — SDK target | 1308 / 0 / 0 / 1 | 22:28:29–22:31:08 | 158.90 s | 521548 KiB |
+| 1.6.7 — historical exploration | 1151 / 0 / 0 / 1 | 22:21:51–22:24:11 | 139.93 s | 397264 KiB |
+| 1.12.7 — historical exploration | 1185 / 0 / 0 / 1 | 22:19:14–22:22:06 | 171.87 s | 564440 KiB |
 
 These are functional-test intervals and reported process peaks, not comparative
 benchmarks or an aggregate memory envelope for all descendants. Every outer
@@ -115,8 +126,9 @@ count. The task is awaited in every version, so a failure would still propagate.
 The inherited broken assertion is the `DistributedStdlibWorker` channel's
 `AbstractChannel` expectation; no lifecycle test is newly skipped or filtered.
 
-The two environments are identified by their complete Project and Manifest
-hashes. The Julia 1.6 environment is also used by the 1.12 run:
+The historical environments are identified by their complete Project and
+Manifest hashes. Both have been removed. The earlier Julia 1.6 environment was
+also used by the historical 1.12 run:
 
 | Environment | Project SHA-256 | Manifest SHA-256 |
 |---|---|---|
@@ -135,8 +147,8 @@ that all admission or completion races are impossible.
 These checks concern local processes on the tested Linux x86-64 host. They do
 not qualify Windows console signals, macOS, ARM, every native extension, all
 Julia releases admitted by the compatibility range or children launched by
-application code. The Julia 1.6 checks use Scratch 1.2.1 because Scratch 1.3.0
-requires a newer Julia; the newer-runtime environment uses Scratch 1.3.0.
+application code. The historical Julia 1.6 checks used Scratch 1.2.1; the Julia
+1.13 environment uses Scratch 1.3.0. This does not lower the SDK runtime floor.
 
 Aqua checks package hygiene. The fresh JET checks target `shutdown`, `stop`,
 `interrupt` and low-level response waiting; their zero diagnostics do not mean

@@ -1,5 +1,8 @@
 # Closing a worker and qualifying its exit
 
+This SDK targets Julia 1.13. Its package, documentation environment and CI use
+that runtime requirement.
+
 A worker has several lifetimes: its operating system process, the RPC socket,
 its output pipes, and the manager tasks that read messages and output. A dead
 process alone does not prove that these other resources have finished. A result
