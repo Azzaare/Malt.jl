@@ -1,8 +1,19 @@
 # Malt.jl
 
+This SDK branch builds on upstream Malt 1.5.0 and adds an explicit worker
+lifecycle API described below. Its changes are maintained in the
+[SDK repository](https://gitlab.naze.baffier.fr/etendu3d/Malt.jl); the original
+upstream project and history remain [JuliaPluto/Malt.jl](https://github.com/JuliaPluto/Malt.jl).
+
 Malt is a multiprocessing package for Julia. It is used by [Pluto.jl](https://plutojl.org/) to manage the Julia process that notebook code is executed in, as a [replacement to Distributed](https://github.com/fonsp/Pluto.jl/pull/2240).
 
-You can find more information on the [**documentation**](https://juliapluto.github.io/Malt.jl).
+The [upstream API manual](https://juliapluto.github.io/Malt.jl) describes the
+original package. The SDK lifecycle additions are documented in this repository.
+
+For shutdown deadlines, output ownership, pending RPCs and checking code/signal
+before accepting a result, see the [worker lifecycle guide](doc/src/lifecycle.md).
+The [verification scope and limits](doc/src/verification.md) distinguish the
+functional tests, platform coverage and historical incidents.
 
 ```julia
 julia> import Malt
@@ -16,7 +27,7 @@ julia> Malt.remote_eval_fetch(worker, :(rand(5))) |> sum
 3.0618168580350966
 ```
 
-Example of running code asynchonously, and interrupting the process:
+Example of running code asynchronously, and interrupting the process:
 
 ```julia
 julia> task = Malt.remote_eval(worker, :(sleep(100)))
@@ -42,7 +53,7 @@ false
 
 ## **Malt.jl** vs **Distributed**
 
-Malt.jl is inspired by the [`Distributed standard library`](https://docs.julialang.org/en/v1/stdlib/Distributed/), but with a focus on process sandboxing, not distributed computing. Important differences are:
+Malt.jl is inspired by the [`Distributed standard library`](https://docs.julialang.org/en/v1/stdlib/Distributed/), with a focus on managing isolated local Julia processes. Important differences are:
 
 
 ### API changes
@@ -58,10 +69,26 @@ Malt.remote_eval_fetch(worker, :(sqrt(123)))
 ### Nested use
 With Malt.jl, any **worker** process can also be a **host** process to its own workers. 
 
-In Distributed, only "process 1 can add or remove workers". Malt.jl does not have this limiation. *This means that Malt.jl workers can use Distributed (and Malt.jl) like a regular Julia process.*
+In Distributed, only "process 1 can add or remove workers". Malt.jl does not have this limitation. *This means that Malt.jl workers can use Distributed (and Malt.jl) like a regular Julia process.*
 
-### Process isolation
-Malt.jl worker processes **do not inherit** `ENV` variables, command-line arguments or the Pkg environment from their host.
+### Process boundaries and environment
+
+A `Malt.Worker` has its own Julia address space. It runs with the same operating
+system account and filesystem permissions as its manager; this is not a security
+sandbox or an authentication protocol for untrusted RPC peers. Child processes
+created by application code require their own lifecycle policy.
+
+The launch command uses Julia's ordinary inherited environment, with
+`OPENBLAS_NUM_THREADS=1` and the supplied `env` entries applied as overrides.
+Do not use process separation as a way to hide parent environment variables.
+The manager's active Pkg project and command-line flags are not automatically
+copied into the child command. Select a project explicitly with `exeflags`, and
+account for variables such as `JULIA_PROJECT` using the usual Julia rules.
+Workers start with `--startup-file=no`.
+
+`Malt.InProcessWorker` executes in the manager's process and provides no separate
+address space. `Malt.DistributedStdlibWorker` delegates process management to
+Distributed; guarantees specific to `Malt.Worker` do not automatically apply to it.
 
 ### Interrupt on Windows
 Malt.jl supports **interrupting a worker process on Windows**, not just on UNIX.
@@ -74,8 +101,11 @@ Exceptions in Malt.jl workers are converted to plaintext before being rethrown i
 
 The original exception object is only available to the worker. In Distributed, the original exception object is serialized and rethrown to the host.
 
-### Faster launch
-Malt.jl launches workers >50% faster.
+### Historical launch measurements
+
+The following upstream comparison predates the lifecycle changes described in
+the documentation. It is retained as historical context, not a qualification of
+the current revision or a guarantee for another machine.
 
 ```
 julia> @time Distributed.addprocs(1);

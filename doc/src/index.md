@@ -121,9 +121,13 @@ Once you're done computing with a worker, or if you find yourself in an unrecove
 The ideal way to terminate a worker is to use the `stop` function,
 this will send a message to the worker requesting a graceful shutdown.
 
-Note that the worker process runs in the same process group as the manager,
-so if you send a [signal](https://en.wikipedia.org/wiki/Signal_(IPC)) to a manager,
-the worker will also get a signal.
+The worker launch requests a detached process. Do not rely on a signal sent to
+the manager's process group to stop its workers or application-created
+descendants. Explicitly close the workers whose handles the manager owns.
+
+Process separation gives each worker its own Julia memory; it does not change
+the operating system account, filesystem permissions or trust required for RPC
+peers. Environment variables are inherited with the launch overrides applied.
 
 ```@docs
 Malt.isrunning
