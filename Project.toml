@@ -13,15 +13,15 @@ Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 [compat]
 # BenchmarkTools 1.8.0 can overflow its Int32 allocation estimate before bounding it.
 BenchmarkTools = "1.0 - 1.7, 1.8.1 - 1"
-Distributed = "1"
+Distributed = "1.6"
 IOCapture = "0.2, 1"
-Logging = "1"
-Random = "1"
+Logging = "1.6"
+Random = "1.6"
 RelocatableFolders = "1"
-Serialization = "1"
-Sockets = "1"
-Test = "1"
-julia = "1.13"
+Serialization = "1.6"
+Sockets = "1.6"
+Test = "1.6"
+julia = "^1.6"
 
 [extras]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
